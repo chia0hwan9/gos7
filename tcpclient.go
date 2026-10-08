@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -36,6 +37,33 @@ const (
 type TCPClientHandler struct {
 	tcpPackager
 	tcpTransporter
+
+	// noEchoWarned 只记一次"该设备不回显 PDU reference"，避免每条报文刷日志
+	noEchoWarned atomic.Bool
+}
+
+// Verify 校验应答确实属于本次请求（判定见 classifyPduRef）：
+//   - 回显本次 reference → 放行；
+//   - 回显最近某次请求的 reference → 上一次超时后迟到的应答被读走了 → ErrStaleResponse，
+//     调用方应丢弃连接重连（否则会静默解析出上一次请求的数据）；
+//   - 其它（0 / 恒定值 / 设备自己的计数）→ 该设备不回显，放行并只警告一次。
+func (h *TCPClientHandler) Verify(request []byte, response []byte) error {
+	switch classifyPduRef(request, response) {
+	case refStale:
+		got := binary.BigEndian.Uint16(response[11:])
+		want := binary.BigEndian.Uint16(request[11:])
+		return fmt.Errorf("%w: got 0x%04X, want 0x%04X", ErrStaleResponse, got, want)
+	case refTooShort:
+		return fmt.Errorf("%w: short telegram (request %d bytes, response %d bytes)",
+			ErrStaleResponse, len(request), len(response))
+	case refNoEcho:
+		if h.noEchoWarned.CompareAndSwap(false, true) && h.Logger != nil {
+			h.Logger.Printf("s7: 该 PLC/网关未回显 PDU reference（应答 0x%04X / 请求 0x%04X），"+
+				"已关闭回显校验；残留应答仍由 Send 失败后的清理兜底",
+				binary.BigEndian.Uint16(response[11:]), binary.BigEndian.Uint16(request[11:]))
+		}
+	}
+	return nil
 }
 
 // NewTCPClientHandler allocates a new TCPClientHandler.
@@ -372,20 +400,55 @@ func (mb *tcpTransporter) closeIdle() {
 	}
 }
 
-// Verify 校验应答确实属于本次请求：S7 的应答必须回显请求的 PDU reference
-// （S7 头第 11-12 字节，含 TPKT+COTP 前缀；Snap7 客户端同样校验该字段）。
+// refVerdict 应答 PDU reference 的判定结果。
+type refVerdict int
+
+const (
+	refOK      refVerdict = iota // 回显本次请求的 reference（正常）
+	refStale                     // 是"最近某次请求"的 reference：迟到的应答被读走了
+	refNoEcho                    // 既不是本次、也不是最近的：该设备不回显 reference
+	refTooShort                  // 报文太短，连 reference 字段都没有
+)
+
+// staleWindow 往回看多少次请求：本连接器的 reference 由 client.nextPduRef 自增，
+// 因此"上 k 次请求的 reference"就等于 want-k，无需额外状态。
+const staleWindow = 2
+
+// classifyPduRef 判定应答的 PDU reference（S7 头第 11-12 字节，含 TPKT+COTP 前缀）。
 //
-// 不一致说明读到的是残留/串包的应答（典型：上一次超时后迟到的应答），返回 ErrStaleResponse
-// 让调用方丢弃连接重连——比"静默解析出上一次请求的数据"安全。
-func (mb *tcpPackager) Verify(request []byte, response []byte) (err error) {
+// 参考实现（libnodave 的设备侧模拟器 ibhsim5.c）会把请求的 reference 原样写回应答
+// （PDUref = 请求 header[4..5] → 应答 header[4..5]），即"回显"是应答方的正常行为。
+// 但并非所有实现都依赖它（Snap7 只给每个请求自增、并不校验回显），所以这里按
+// 三态处理：回显本次 = 正常；回显最近的某次 = 残留应答（要拦）；其它 = 设备不回显（不拦，
+// 由调用方记一条日志），否则这类设备会永远连不上。
+func classifyPduRef(request []byte, response []byte) refVerdict {
 	if len(request) < 13 || len(response) < 13 {
-		return fmt.Errorf("%w: short telegram (request %d bytes, response %d bytes)",
-			ErrStaleResponse, len(request), len(response))
+		return refTooShort
 	}
 	want := binary.BigEndian.Uint16(request[11:])
 	got := binary.BigEndian.Uint16(response[11:])
-	if got != want {
-		return fmt.Errorf("%w: got 0x%04X, want 0x%04X", ErrStaleResponse, got, want)
+	if got == want {
+		return refOK
 	}
-	return nil
+	// 自增序列（跳过 0）里往回数：want-1、want-2…
+	for k := uint16(1); k <= staleWindow; k++ {
+		if got == prevRef(want, k) {
+			return refStale
+		}
+	}
+	return refNoEcho
+}
+
+// prevRef 返回 reference 序列里往回数第 k 个。序列由 client.nextPduRef 自增且**跳过 0**，
+// 所以这里也要跳过 0（第一支请求的"上一次"约定为 0xFFFF，0 永远不会是真正发过的引用）。
+func prevRef(want uint16, k uint16) uint16 {
+	ref := want
+	for i := uint16(0); i < k; i++ {
+		if ref <= 1 {
+			ref = 0xFFFF
+			continue
+		}
+		ref--
+	}
+	return ref
 }

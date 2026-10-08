@@ -90,13 +90,21 @@ but whose answer arrives later, then gets read as the answer to the *next* reque
    incrementing reference into the S7 header (bytes 11-12, `setPduRef` + `client.nextPduRef`).
    Previously every request reused the constant `5,0` from the telegram template, so a response
    could not be attributed to a request at all.
-2. **Real `Verify`.** `tcpPackager.Verify` (an upstream empty stub, "reserve for future use") now
-   compares the reference echoed by the PLC with the request's and returns
-   `ErrStaleResponse` (`errors.Is`-able) on mismatch or on a too-short telegram. Callers should
-   drop the connection and reconnect instead of parsing the stale payload — without this, gos7
-   silently returns the *previous* request's data, or panics on a short payload.
-   The check relies on the PLC echoing the reference, which the S7 protocol requires and the
-   Snap7 client also validates.
+2. **Real `Verify`.** `TCPClientHandler.Verify` (the upstream stub was "reserve for future use")
+   classifies the response's reference against the request's:
+   * equal → normal (the responder echoes it);
+   * equal to one of the **last two** requests' references → `ErrStaleResponse` (`errors.Is`-able):
+     that is the late answer of an earlier request being read as ours — without the check gos7
+     silently returns the *previous* request's data, or panics on a short payload;
+   * anything else (0, a constant, the device's own counter) → treated as a device that does **not**
+     echo the reference: allowed through, with a single warning log.
+
+   Echoing is what a conforming responder does — libnodave's device-side simulator (`ibhsim5.c`)
+   copies the request's reference into the response header (`resp[21..22] = p1.header[4..5]`), and
+   Snap7's client auto-increments a sequence per request (`PDUH_out->Sequence = GetNextWord()`).
+   But Snap7 never *validates* the echo, so implementations that ignore the field exist; rejecting
+   those outright would make the channel unusable, hence the third case above (residual frames are
+   still cleaned up by the drain).
 3. **Drain after a failed exchange.** `tcpTransporter.Send` sets `needsDrain` when an exchange does
    not finish cleanly and, before the next exchange, discards whatever bytes have already arrived
    (`drainPendingLocked`). Upstream never cleaned the socket (`flush` was written but never called,
@@ -105,9 +113,10 @@ but whose answer arrives later, then gets read as the answer to the *next* reque
 
 Also removed: a leftover `log.Printf` debug line in `Send` (it spammed stderr on every read error).
 
-Tests: `stale_response_test.go` (reference counter, `Verify` table, and end-to-end over a loopback
-TCP pair: reference increments/echoes, a mismatched echo is reported as `ErrStaleResponse`, and
-stale bytes are drained before the next request).
+Tests: `stale_response_test.go` (reference counter, `Verify` classification table, and end-to-end
+over a loopback TCP pair: reference increments/echoes, a response echoing the *previous* request is
+reported as `ErrStaleResponse`, a non-echoing responder is tolerated with one warning, and stale
+bytes are drained before the next request).
 
 Simatic, Simatic S5, Simatic S7, S7-200, S7-300, S7-400, S7-1200, S7-1500 are registered Trademarks of Siemens
 

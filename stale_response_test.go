@@ -5,7 +5,9 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"log"
 	"net"
+	"strings"
 	"testing"
 	"time"
 )
@@ -46,15 +48,19 @@ func TestVerify_DetectsStaleResponse(t *testing.T) {
 		response []byte
 		wantErr  bool
 	}{
-		{"reference 一致", mk(7, 26), mk(7, 26), false},
-		{"reference 不一致（残留应答）", mk(7, 26), mk(6, 26), true},
-		{"应答 reference 为 0", mk(7, 26), mk(0, 26), true},
+		{"回显本次 reference", mk(7, 26), mk(7, 26), false},
+		{"回显上一次请求的 reference（迟到的应答）", mk(7, 26), mk(6, 26), true},
+		{"回显上上次请求的 reference", mk(7, 26), mk(5, 26), true},
+		{"回显上一次（跨 0 回绕）", mk(1, 26), mk(0xFFFF, 26), true},
+		{"不回显（恒为 0）→ 放行", mk(7, 26), mk(0, 26), false},
+		{"不回显（设备自己的计数）→ 放行", mk(7, 26), mk(0x0500, 26), false},
+		{"应答 future reference（不属于本设备历史）→ 放行", mk(7, 26), mk(8, 26), false},
 		{"应答过短", mk(7, 26), mk(7, 8), true},
 		{"请求过短", mk(7, 8), mk(7, 26), true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := (&tcpPackager{}).Verify(tc.request, tc.response)
+			err := (&TCPClientHandler{}).Verify(tc.request, tc.response)
 			if tc.wantErr && !errors.Is(err, ErrStaleResponse) {
 				t.Fatalf("应返回 ErrStaleResponse，实际: %v", err)
 			}
@@ -94,9 +100,14 @@ func newFakePLCPair(t *testing.T) (*TCPClientHandler, net.Conn) {
 	return h, server
 }
 
-// serveOneRead 读一个完整请求，按 refShift 回显 reference（0=正确回显，1=模拟残留应答），
+// serveOneRead 读一个完整请求，按 refShift 回显 reference（0=正确回显，0xFFFF=回显上一次），
 // 返回收到的请求报文。
 func serveOneRead(server net.Conn, data []byte, refShift uint16) ([]byte, error) {
+	return serveOneReadRef(server, data, func(want uint16) uint16 { return want + refShift })
+}
+
+// serveOneReadRef 同上，但由调用方直接决定应答里的 reference（用于模拟"不回显"的设备）。
+func serveOneReadRef(server net.Conn, data []byte, refOf func(want uint16) uint16) ([]byte, error) {
 	hdr := make([]byte, 4)
 	if _, err := io.ReadFull(server, hdr); err != nil {
 		return nil, err
@@ -107,7 +118,11 @@ func serveOneRead(server net.Conn, data []byte, refShift uint16) ([]byte, error)
 		return nil, err
 	}
 	req := append(append([]byte{}, hdr...), rest...)
-	ref := binary.BigEndian.Uint16(req[11:]) + refShift
+	want := binary.BigEndian.Uint16(req[11:])
+	ref := want
+	if refOf != nil {
+		ref = refOf(want)
+	}
 
 	// S7 读应答：TPKT+COTP(7) + 头(12) + 参数(2) + item 头(4) + 数据
 	resp := make([]byte, 25+len(data))
@@ -173,17 +188,46 @@ func TestAGReadDB_PduReferenceIncrementsAndMatches(t *testing.T) {
 	}
 }
 
-// 应答回显不一致（残留应答）→ 返回 ErrStaleResponse，而不是把上一次的数据当成本次结果。
+// 应答回显"上一次请求"的 reference（迟到的应答被读走）→ ErrStaleResponse，
+// 而不是把上一次的数据当成本次结果。
 func TestAGReadDB_StaleResponseDetected(t *testing.T) {
 	h, server := newFakePLCPair(t)
 	c := NewClient(h)
 
-	go func() { _, _ = serveOneRead(server, []byte{1, 2}, 1) }() // 回显 ref+1
-
+	// 先正常读一次（reference=1），第二次请求的应答故意回显 reference=1（= want-1）
+	go func() { _, _ = serveOneRead(server, []byte{9, 9}, 0) }()
 	buf := make([]byte, 2)
+	if err := c.AGReadDB(1, 0, 2, buf); err != nil {
+		t.Fatalf("第一次读应成功: %v", err)
+	}
+
+	go func() { _, _ = serveOneRead(server, []byte{1, 2}, 0xFFFF) }() // uint16 回绕 → ref-1
 	err := c.AGReadDB(1, 0, 2, buf)
 	if !errors.Is(err, ErrStaleResponse) {
 		t.Fatalf("应识别为残留应答，实际: %v（buf=% X）", err, buf)
+	}
+}
+
+// 设备不回显 reference（应答恒为 0）时不能把通道判死：放行 + 只警告一次。
+func TestAGReadDB_NonEchoingDeviceTolerated(t *testing.T) {
+	h, server := newFakePLCPair(t)
+	var logs bytes.Buffer
+	h.Logger = log.New(&logs, "", 0)
+	c := NewClient(h)
+	data := []byte{0x33, 0x44}
+
+	for i := 0; i < 2; i++ {
+		go func() { _, _ = serveOneReadRef(server, data, func(uint16) uint16 { return 0 }) }()
+		buf := make([]byte, 2)
+		if err := c.AGReadDB(1, 0, 2, buf); err != nil {
+			t.Fatalf("第 %d 次读不应失败（设备不回显 reference 应放行）: %v", i+1, err)
+		}
+		if !bytes.Equal(buf, data) {
+			t.Fatalf("第 %d 次读数据不符: % X", i+1, buf)
+		}
+	}
+	if n := strings.Count(logs.String(), "未回显 PDU reference"); n != 1 {
+		t.Fatalf("应只警告一次，实际 %d 次：%s", n, logs.String())
 	}
 }
 
