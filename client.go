@@ -252,16 +252,23 @@ func (mb *client) readArea(area int, dbNumber int, start int, amount int, wordLe
 		err = sendError
 
 		if err == nil {
-			if size := len(response.Data); size < 25 {
-				err = fmt.Errorf(ErrorText(errIsoInvalidDataSize)+"'%v'", len(response.Data))
-			} else {
-				if response.Data[21] != 0xFF {
-					err = fmt.Errorf(ErrorText(CPUError(uint(response.Data[21]))))
-				} else {
-					//copy response to buffer
-					copy(buffer[offset:offset+sizeRequested], response.Data[25:25+sizeRequested])
-					offset += sizeRequested
-				}
+			size := len(response.Data)
+			switch {
+			case size < 25:
+				err = fmt.Errorf(ErrorText(errIsoInvalidDataSize)+"'%v'", size)
+			case response.Data[21] != 0xFF:
+				err = fmt.Errorf(ErrorText(CPUError(uint(response.Data[21]))))
+			case size-25 < sizeRequested:
+				// 对端截断了应答：上游在这里 response.Data[25:25+sizeRequested] 会越界 panic
+				err = fmt.Errorf("%w: got %d bytes, want %d", ErrShortReadResponse, size-25, sizeRequested)
+			case offset+sizeRequested > len(buffer):
+				// 调用方缓冲区不足：上游在这里 buffer[offset:offset+sizeRequested] 会越界 panic
+				err = fmt.Errorf("%w: have %d bytes, need %d (offset %d)",
+					ErrBufferTooSmall, len(buffer), offset+sizeRequested, offset)
+			default:
+				//copy response to buffer
+				copy(buffer[offset:offset+sizeRequested], response.Data[25:25+sizeRequested])
+				offset += sizeRequested
 			}
 
 		}
@@ -375,6 +382,12 @@ func (mb *client) writeArea(area int, dbnumber int, start int, amount int, wordl
 		binary.BigEndian.PutUint16(request.Data[33:], uint16(length))
 
 		//expand values into array
+		if offset+dataSize > len(buffer) {
+			// 调用方缓冲区不足：上游在这里 buffer[offset:offset+dataSize] 会越界 panic
+			err = fmt.Errorf("%w: have %d bytes, need %d (offset %d)",
+				ErrBufferTooSmall, len(buffer), offset+dataSize, offset)
+			return
+		}
 		request.Data = append(request.Data[:35], append(buffer[offset:offset+dataSize], request.Data[35:]...)...)
 		setPduRef(request.Data, mb.nextPduRef())
 		response, sendError := mb.send(&request)
@@ -514,8 +527,12 @@ func (mb *client) send(request *ProtocolDataUnit) (response *ProtocolDataUnit, e
 //responseError get response error from pdu return S7Error with high and low byte
 func responseError(response *ProtocolDataUnit) error {
 	s7Error := &S7Error{}
-	if response.Data != nil && len(response.Data) > 0 {
-		switch int(response.Data[1]) {
+	// 上游只检查了 len>0 就按 Data[1] 去取 Data[2..3] / Data[10..11]：短报文会越界 panic。
+	// 这里要求至少 12 字节（S7 应答头长度），否则没有可提取的错误信息。
+	if response == nil || len(response.Data) < 12 {
+		return nil
+	}
+	switch int(response.Data[1]) {
 		case 1:
 		case 7:
 			s7Error.High = response.Data[2]
@@ -528,7 +545,6 @@ func responseError(response *ProtocolDataUnit) error {
 			break
 		default:
 			return nil
-		}
 	}
 	return s7Error
 }

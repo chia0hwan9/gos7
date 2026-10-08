@@ -110,13 +110,27 @@ but whose answer arrives later, then gets read as the answer to the *next* reque
    (`drainPendingLocked`). Upstream never cleaned the socket (`flush` was written but never called,
    and it used `time.Now()` as the read deadline, which Go's netpoll treats as "already expired" —
    so it could not have read anything anyway).
+4. **No panics in the read/write paths.** `readArea` used to slice `response.Data[25:25+n]` and
+   `buffer[offset:offset+n]` unguarded: a truncated response panicked (bringing the whole gateway
+   process down) and a too-small caller buffer panicked too. Now:
+   * a response carrying fewer bytes than requested → `ErrShortReadResponse`. Note it is *worse*
+     than a panic when the answer is long enough to pass the library's own `len < 25` check but
+     *longer* than requested — that older behaviour silently consumed the wrong bytes, which is why
+     `Verify` (item 2) also checks the reference;
+   * a caller buffer that cannot hold the data → `ErrBufferTooSmall`;
+   * `responseError` requires a 12-byte header before reading `Data[2..3]` / `Data[10..11]`.
+
+   `Verify` also rejects telegrams shorter than 13 bytes, so `responseError` can no longer be
+   reached with a short frame at all.
 
 Also removed: a leftover `log.Printf` debug line in `Send` (it spammed stderr on every read error).
 
 Tests: `stale_response_test.go` (reference counter, `Verify` classification table, and end-to-end
 over a loopback TCP pair: reference increments/echoes, a response echoing the *previous* request is
 reported as `ErrStaleResponse`, a non-echoing responder is tolerated with one warning, and stale
-bytes are drained before the next request).
+bytes are drained before the next request) and `panic_safety_test.go` (short response, short caller
+buffers for read and write, and `responseError` over short frames — all return errors / no-ops
+instead of panicking).
 
 Simatic, Simatic S5, Simatic S7, S7-200, S7-300, S7-400, S7-1200, S7-1500 are registered Trademarks of Siemens
 

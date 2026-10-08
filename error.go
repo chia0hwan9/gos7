@@ -15,6 +15,16 @@ import (
 // 所以这里显式报错，调用方应丢弃连接后重连（go-iidc 的 S7 连接器把它当作断线）。
 var ErrStaleResponse = errors.New("s7: stale response (PDU reference mismatch)")
 
+// ErrShortReadResponse 应答携带的数据少于请求（对端截断了应答）。
+//
+// 上游在这里直接 `copy(buf, response.Data[25:25+n])` —— 越界 panic（网关侧表现为
+// 整个进程被带崩）。现在返回错误：帧长度是按 TPKT 读完的、流仍然对齐，调用方把相关点
+// 标 BAD 即可，不必断连。
+var ErrShortReadResponse = errors.New("s7: short read response")
+
+// ErrBufferTooSmall 调用方给的缓冲区装不下请求/写入的数据（调用方误用；上游同样会切片越界 panic）。
+var ErrBufferTooSmall = errors.New("s7: buffer too small")
+
 const (
 	errTCPSocketCreation    = 1
 	errTCPConnectionTimeout = 2
