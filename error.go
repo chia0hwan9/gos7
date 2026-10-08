@@ -3,7 +3,17 @@ package gos7
 // Copyright 2018 Trung Hieu Le. All rights reserved.
 // This software may be modified and distributed under the terms
 // of the BSD license. See the LICENSE file for details.
-import "strconv"
+import (
+	"errors"
+	"strconv"
+)
+
+// ErrStaleResponse 应答回显的 PDU reference 与请求不一致：读到的不是本次请求的应答。
+//
+// 典型来源：上一次收发超时后，PLC 迟到的应答还留在 socket 缓冲里，被下一次收发当成
+// 自己的应答读走。放任它继续解析会**静默得到上一次请求的数据**（甚至切片越界 panic），
+// 所以这里显式报错，调用方应丢弃连接后重连（go-iidc 的 S7 连接器把它当作断线）。
+var ErrStaleResponse = errors.New("s7: stale response (PDU reference mismatch)")
 
 const (
 	errTCPSocketCreation    = 1

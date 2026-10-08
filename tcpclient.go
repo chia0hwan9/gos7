@@ -105,6 +105,10 @@ type tcpTransporter struct {
 	LastPDUType                   byte
 
 	PDULength int
+
+	// needsDrain 上一次收发没有干净收尾（超时/IO 错误）后置位：下一次收发前先丢弃 socket 里
+	// 已经到达的残留字节（PLC 迟到的应答），避免它被当成本次请求的应答读走。
+	needsDrain bool
 }
 
 func (mb *tcpTransporter) setConnectionParameters(address string, localTSAP uint16, remoteTSAP uint16) {
@@ -125,6 +129,13 @@ func (mb *tcpTransporter) setConnectionParameters(address string, localTSAP uint
 func (mb *tcpTransporter) Send(request []byte) (response []byte, err error) {
 	mb.mu.Lock()
 	defer mb.mu.Unlock()
+	defer func() {
+		if err != nil {
+			// 本次交换没有干净收尾（超时/IO 错误/非法 PDU）：PLC 的应答可能还在路上。
+			// 置位后由下一次 Send 先丢弃，避免迟到的应答被当成下一次请求的应答。
+			mb.needsDrain = true
+		}
+	}()
 	// Set timer to close when idle
 	mb.lastActivity = time.Now()
 	mb.startCloseTimer()
@@ -136,6 +147,11 @@ func (mb *tcpTransporter) Send(request []byte) (response []byte, err error) {
 	if mb.conn == nil {
 		err = fmt.Errorf("Connection to address %s is null", mb.Address)
 		return
+	}
+	// 上一次交换失败过 → 先丢弃已经到达的残留字节（迟到的应答），再设本次超时
+	if mb.needsDrain {
+		mb.drainPendingLocked()
+		mb.needsDrain = false
 	}
 	if err = mb.conn.SetDeadline(timeout); err != nil {
 		return
@@ -151,7 +167,6 @@ func (mb *tcpTransporter) Send(request []byte) (response []byte, err error) {
 	for !done && err == nil {
 		// Get TPKT (4 bytes)
 		if _, err = io.ReadFull(mb.conn, data[:4]); err != nil {
-			log.Printf("%T %+v", err, err)
 			return
 		}
 		// Read length, ignore transaction & protocol id (4 bytes)
@@ -303,6 +318,30 @@ func (mb *tcpTransporter) flush(b []byte) (err error) {
 	return
 }
 
+// drainPendingLocked 丢弃 socket 里**已经到达**的残留字节：读截止时间设为极短的未来时刻
+// （1ms），只吃不等待（循环直到读不到数据 / 出错 / 上限）。
+//
+// 用在"上一次收发失败（超时等）"之后：PLC 迟到的应答会留在缓冲里，不清掉就会被下一次
+// 收发当成自己的应答（gos7 原本没有任何清理，`flush` 也从不被调用）。
+// 注意不能用 `time.Now()` 作截止时间：Go 的 netpoll 在截止时间已过时**直接返回超时**、
+// 不读缓冲（上游的 flush 正是这么写的，所以它即使被调用也读不到东西）。
+// 必须在持有 mb.mu 时调用。
+func (mb *tcpTransporter) drainPendingLocked() {
+	if mb.conn == nil {
+		return
+	}
+	if err := mb.conn.SetReadDeadline(time.Now().Add(time.Millisecond)); err != nil {
+		return
+	}
+	buf := make([]byte, tcpMaxLength)
+	for i := 0; i < 16; i++ {
+		n, err := mb.conn.Read(buf)
+		if n == 0 || err != nil {
+			return // 没有更多残留：超时（正常）/EOF/连接已关
+		}
+	}
+}
+
 func (mb *tcpTransporter) logf(format string, v ...interface{}) {
 	if mb.Logger != nil {
 		mb.Logger.Printf(format, v...)
@@ -333,7 +372,20 @@ func (mb *tcpTransporter) closeIdle() {
 	}
 }
 
-// reserve for future use, need to verify the request and response
+// Verify 校验应答确实属于本次请求：S7 的应答必须回显请求的 PDU reference
+// （S7 头第 11-12 字节，含 TPKT+COTP 前缀；Snap7 客户端同样校验该字段）。
+//
+// 不一致说明读到的是残留/串包的应答（典型：上一次超时后迟到的应答），返回 ErrStaleResponse
+// 让调用方丢弃连接重连——比"静默解析出上一次请求的数据"安全。
 func (mb *tcpPackager) Verify(request []byte, response []byte) (err error) {
-	return
+	if len(request) < 13 || len(response) < 13 {
+		return fmt.Errorf("%w: short telegram (request %d bytes, response %d bytes)",
+			ErrStaleResponse, len(request), len(response))
+	}
+	want := binary.BigEndian.Uint16(request[11:])
+	got := binary.BigEndian.Uint16(response[11:])
+	if got != want {
+		return fmt.Errorf("%w: got 0x%04X, want 0x%04X", ErrStaleResponse, got, want)
+	}
+	return nil
 }

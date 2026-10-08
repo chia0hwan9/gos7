@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync/atomic"
 )
 
 const (
@@ -59,6 +60,27 @@ type ClientHandler interface {
 type client struct {
 	packager    Packager
 	transporter Transporter
+
+	// pduRef 请求序号：每个读/写请求自增后写进报文的 PDU reference 字段（S7 头第 11-12 字节），
+	// 应答必须回显同一个值（见 tcpPackager.Verify）。这样"上一次超时后迟到的应答"能被识别出来，
+	// 而不是被当成本次请求的应答静默解析。Snap7 客户端同样校验该字段。
+	pduRef atomic.Uint32
+}
+
+// nextPduRef 返回本次请求的 PDU reference：从 1 起自增，跳过 0（0 留给握手报文）。
+func (mb *client) nextPduRef() uint16 {
+	for {
+		if ref := uint16(mb.pduRef.Add(1)); ref != 0 {
+			return ref
+		}
+	}
+}
+
+// setPduRef 把 PDU reference 写入报文（含 TPKT+COTP 前缀，S7 头从第 7 字节开始）。
+func setPduRef(request []byte, ref uint16) {
+	if len(request) >= 13 {
+		binary.BigEndian.PutUint16(request[11:], ref)
+	}
 }
 
 // NewClient creates a new s7 client with given backend handler.
@@ -224,6 +246,7 @@ func (mb *client) readArea(area int, dbNumber int, start int, amount int, wordLe
 		request.Data[29] = byte(address & 0x0FF)
 		address = address >> 8
 		request.Data[28] = byte(address & 0x0FF)
+		setPduRef(request.Data, mb.nextPduRef())
     var response *ProtocolDataUnit
 		response, sendError := mb.send(&request)
 		err = sendError
@@ -353,6 +376,7 @@ func (mb *client) writeArea(area int, dbnumber int, start int, amount int, wordl
 
 		//expand values into array
 		request.Data = append(request.Data[:35], append(buffer[offset:offset+dataSize], request.Data[35:]...)...)
+		setPduRef(request.Data, mb.nextPduRef())
 		response, sendError := mb.send(&request)
 		err = sendError
 		if err == nil {

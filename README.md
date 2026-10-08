@@ -80,6 +80,35 @@ References
 - SIMATIC NET FDL-Programmierschnittstelle (doku)
 - Elementary Data Types from Siemens (doku)
 
+Fork notes (chia0hwan9/gos7)
+----------
+This fork keeps the upstream module path (`github.com/robinson/gos7`) so it can be used with a
+`replace` directive, and adds three changes around **stale responses** (a request that timed out
+but whose answer arrives later, then gets read as the answer to the *next* request):
+
+1. **Per-request PDU reference.** `readArea` / `writeArea` / `AGReadMulti` / `AGWriteMulti` write an
+   incrementing reference into the S7 header (bytes 11-12, `setPduRef` + `client.nextPduRef`).
+   Previously every request reused the constant `5,0` from the telegram template, so a response
+   could not be attributed to a request at all.
+2. **Real `Verify`.** `tcpPackager.Verify` (an upstream empty stub, "reserve for future use") now
+   compares the reference echoed by the PLC with the request's and returns
+   `ErrStaleResponse` (`errors.Is`-able) on mismatch or on a too-short telegram. Callers should
+   drop the connection and reconnect instead of parsing the stale payload — without this, gos7
+   silently returns the *previous* request's data, or panics on a short payload.
+   The check relies on the PLC echoing the reference, which the S7 protocol requires and the
+   Snap7 client also validates.
+3. **Drain after a failed exchange.** `tcpTransporter.Send` sets `needsDrain` when an exchange does
+   not finish cleanly and, before the next exchange, discards whatever bytes have already arrived
+   (`drainPendingLocked`). Upstream never cleaned the socket (`flush` was written but never called,
+   and it used `time.Now()` as the read deadline, which Go's netpoll treats as "already expired" —
+   so it could not have read anything anyway).
+
+Also removed: a leftover `log.Printf` debug line in `Send` (it spammed stderr on every read error).
+
+Tests: `stale_response_test.go` (reference counter, `Verify` table, and end-to-end over a loopback
+TCP pair: reference increments/echoes, a mismatched echo is reported as `ErrStaleResponse`, and
+stale bytes are drained before the next request).
+
 Simatic, Simatic S5, Simatic S7, S7-200, S7-300, S7-400, S7-1200, S7-1500 are registered Trademarks of Siemens
 
 License
