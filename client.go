@@ -103,6 +103,30 @@ func (mb *client) AGWriteDB(dbNumber int, start int, size int, buffer []byte) (e
 	return mb.writeArea(s7areadb, dbNumber, start, size, s7wlbyte, buffer)
 }
 
+// AGWriteDBBit 以原生位写的方式写 DB 里的一个位（DBx.DBX<byteAdr>.<bit>）。
+//
+// 发出去的是单条 WriteVar：参数项 transport size = BIT(0x01)、地址按**位**编码
+// （byteAdr*8+bit）、数据项 transport size = BIT(0x03)、长度 = 1(位)、数据 1 字节
+// （置位 0x01 / 复位 0x00）。与 Snap7/Sharp7 的 WriteArea(S7WLBit)、S7.Net 的
+// WriteBit(BitPackage) 编码一致。
+//
+// 因此不需要"读整字节 → 改目标位 → 写整字节"：PLC 侧只有一次按位访问，
+// 同字节里其它位（包括 PLC 程序/HMI 在此期间改过的位）不会被子写覆盖。
+func (mb *client) AGWriteDBBit(dbNumber int, byteAdr int, bit int, value bool) (err error) {
+	if bit < 0 || bit > 7 {
+		return fmt.Errorf("s7: bit %d is out of range, a byte has bits 0-7", bit)
+	}
+	if byteAdr < 0 {
+		return fmt.Errorf("s7: byte address %d is invalid", byteAdr)
+	}
+	var payload byte
+	if value {
+		payload = 0x01
+	}
+	// writeArea 对 s7wlbit 固定只发 1 个元素，并把 start 当**位地址**解释。
+	return mb.writeArea(s7areadb, dbNumber, byteAdr*8+bit, 1, s7wlbit, []byte{payload})
+}
+
 //implement of the interface AGReadMB
 func (mb *client) AGReadMB(start int, size int, buffer []byte) (err error) {
 	return mb.readArea(s7areamk, 0, start, size, s7wlbyte, buffer)

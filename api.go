@@ -14,6 +14,8 @@ type Client interface {
 	AGReadDB(dbNumber int, start int, size int, buffer []byte) (err error)
 	//write data blocks into PLC
 	AGWriteDB(dbNumber int, start int, size int, buffer []byte) (err error)
+	//write a single bit of a DB as a native bit write (transport size BIT, no read-modify-write)
+	AGWriteDBBit(dbNumber int, byteAdr int, bit int, value bool) (err error)
 	//Read Merkers area from PLC
 	AGReadMB(start int, size int, buffer []byte) (err error)
 	//Write Merkers from into PLC
