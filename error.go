@@ -77,6 +77,7 @@ const (
 	errCliInvalidParamNumber     = 0x02500000
 	errCliCannotChangeParam      = 0x02600000
 	errCliFunctionNotImplemented = 0x02700000
+	errCliPDUReferenceMismatch   = 0x02800000
 
 	code7Ok                    = 0
 	code7AddressOutOfRange     = 5
@@ -196,6 +197,8 @@ func ErrorText(err int) string {
 		return "CLI : Cannot change this param now"
 	case errCliFunctionNotImplemented:
 		return "CLI : Function not implemented"
+	case errCliPDUReferenceMismatch:
+		return "CLI : PDU reference mismatch, the response answers another request"
 	default:
 		return "CLI : Unknown error (" + strconv.Itoa(err) + ")"
 	}

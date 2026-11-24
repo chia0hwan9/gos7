@@ -5,7 +5,7 @@ Overview
 -------------------
 For years, numerous drivers/connectors, available in both commercial and open source domains, have supported the connection to S7 family PLC devices. GoS7 fills the gaps in the S7 protocol, implementing it with pure Go (also known as golang). There is a strong belief that low-level communication should be implemented with a low-level programming language that is close to binary and memory.
 
-The minimum supported Go version is 1.13.
+The minimum supported Go version is 1.21 (see `go.mod`).
 
 Functions
 -------------------
@@ -71,6 +71,15 @@ var result uint16
 s7.GetValueAt(buf, 0, &result)	 
   
 ```
+Request/response matching
+----------
+Every request carries a running PDU reference and the reply has to echo it. A reply with another
+reference (for example a late answer after a timeout at a slow gateway) is discarded by the TCP
+transporter, which keeps waiting for the matching reply until the timeout expires. Transporters other
+than the TCP one get the error `CLI : PDU reference mismatch` from the packager. A read reply whose item
+does not hold the requested number of bytes is rejected with `CLI : Invalid data size received` and
+leaves the caller's buffer untouched.
+
 References
 ----------
 - libnodave http://libnodave.sourceforge.net/
@@ -83,54 +92,52 @@ References
 Fork notes (chia0hwan9/gos7)
 ----------
 This fork keeps the upstream module path (`github.com/robinson/gos7`) so it can be used with a
-`replace` directive, and adds three changes around **stale responses** (a request that timed out
-but whose answer arrives later, then gets read as the answer to the *next* request):
+`replace` directive. Upstream 619ce8b landed its own request/response matching (see
+"Request/response matching" above), so the fork no longer carries a PDU-reference implementation of
+its own; it keeps only the deltas below.
 
-1. **Per-request PDU reference.** `readArea` / `writeArea` / `AGReadMulti` / `AGWriteMulti` write an
-   incrementing reference into the S7 header (bytes 11-12, `setPduRef` + `client.nextPduRef`).
-   Previously every request reused the constant `5,0` from the telegram template, so a response
-   could not be attributed to a request at all.
-2. **Real `Verify`.** `TCPClientHandler.Verify` (the upstream stub was "reserve for future use")
-   classifies the response's reference against the request's:
-   * equal → normal (the responder echoes it);
-   * equal to one of the **last two** requests' references → `ErrStaleResponse` (`errors.Is`-able):
-     that is the late answer of an earlier request being read as ours — without the check gos7
-     silently returns the *previous* request's data, or panics on a short payload;
-   * anything else (0, a constant, the device's own counter) → treated as a device that does **not**
-     echo the reference: allowed through, with a single warning log.
-
-   Echoing is what a conforming responder does — libnodave's device-side simulator (`ibhsim5.c`)
-   copies the request's reference into the response header (`resp[21..22] = p1.header[4..5]`), and
-   Snap7's client auto-increments a sequence per request (`PDUH_out->Sequence = GetNextWord()`).
-   But Snap7 never *validates* the echo, so implementations that ignore the field exist; rejecting
-   those outright would make the channel unusable, hence the third case above (residual frames are
-   still cleaned up by the drain).
+1. **`ErrStaleResponse` sentinel.** `tcpPackager.Verify` returns an error that both keeps upstream's
+   `CLI : PDU reference mismatch` text and wraps `ErrStaleResponse` (`errors.Is`-able), so callers
+   that treat a mismatched reply as "connection is out of sync, drop and reconnect" keep working.
+2. **`TolerateNoEcho`.** Upstream requires the reply to echo the PDU reference. A PLC or gateway that
+   does not (returns 0 / a constant / its own counter) would then wait for the timeout on *every*
+   exchange, i.e. the channel never works. Setting `handler.TolerateNoEcho = true` accepts any reply
+   with a single warning, at the cost of losing late-reply detection (only the drain below remains).
+   Default is `false` (upstream behaviour).
+   Background: echoing is what a conforming responder does — libnodave's device-side simulator
+   (`ibhsim5.c`) copies the request's reference into the response header, and Snap7's client
+   auto-increments a sequence per request — but Snap7 never *validates* the echo, so implementations
+   that ignore the field exist.
 3. **Drain after a failed exchange.** `tcpTransporter.Send` sets `needsDrain` when an exchange does
    not finish cleanly and, before the next exchange, discards whatever bytes have already arrived
    (`drainPendingLocked`). Upstream never cleaned the socket (`flush` was written but never called,
    and it used `time.Now()` as the read deadline, which Go's netpoll treats as "already expired" —
-   so it could not have read anything anyway).
-4. **No panics in the read/write paths.** `readArea` used to slice `response.Data[25:25+n]` and
-   `buffer[offset:offset+n]` unguarded: a truncated response panicked (bringing the whole gateway
-   process down) and a too-small caller buffer panicked too. Now:
-   * a response carrying fewer bytes than requested → `ErrShortReadResponse`. Note it is *worse*
-     than a panic when the answer is long enough to pass the library's own `len < 25` check but
-     *longer* than requested — that older behaviour silently consumed the wrong bytes, which is why
-     `Verify` (item 2) also checks the reference;
+   so it could not have read anything anyway). This complements upstream's discard-until-match loop:
+   the drain removes bytes already sitting in the buffer, the loop handles replies that arrive later.
+4. **No panics in the read/write paths.** `readArea` sliced `response.Data[25:25+n]` and
+   `buffer[offset:offset+n]` unguarded: a truncated response silently zero-padded the caller's
+   buffer (upstream now checks the announced item length), and a too-small caller buffer panicked.
+   Now:
+   * a response shorter than requested (or whose item announces another length) →
+     `ErrShortReadResponse`, keeping upstream's `CLI : Invalid data size received` wording;
    * a caller buffer that cannot hold the data → `ErrBufferTooSmall`;
-   * `responseError` requires a 12-byte header before reading `Data[2..3]` / `Data[10..11]`.
-
-   `Verify` also rejects telegrams shorter than 13 bytes, so `responseError` can no longer be
-   reached with a short frame at all.
+   * `responseError` reads the PDU type at byte 8 and the error class/code at 17-18 (upstream
+     af99822) and additionally never touches a frame shorter than TPKT+COTP+S7 header.
+5. **`AGWriteDBBit`.** Native single-bit DB write (`transport size = BIT`, no read-modify-write):
+   `client.AGWriteDBBit(db, byteAdr, bit, value)` sends one `WriteVar` whose parameter lists
+   `TS=BIT(0x01)`, bit-addressed offset `byteAdr*8+bit`, data item `TS=BIT(0x03)`, length 1 (bit) and
+   one data byte. Same encoding as Snap7/Sharp7's `WriteArea(S7WLBit)` and S7.Net's `WriteBit`.
+   Callers that could only write whole bytes had to do read-modify-write and could overwrite the
+   neighbouring bits with a value the PLC changed in between.
 
 Also removed: a leftover `log.Printf` debug line in `Send` (it spammed stderr on every read error).
 
-Tests: `stale_response_test.go` (reference counter, `Verify` classification table, and end-to-end
-over a loopback TCP pair: reference increments/echoes, a response echoing the *previous* request is
-reported as `ErrStaleResponse`, a non-echoing responder is tolerated with one warning, and stale
-bytes are drained before the next request) and `panic_safety_test.go` (short response, short caller
-buffers for read and write, and `responseError` over short frames — all return errors / no-ops
-instead of panicking).
+Tests: upstream's `client_test.go` / `response_test.go` / `control_test.go` / `datetime_test.go` cover
+the merged upstream behaviour; fork-only coverage lives in `stale_response_test.go` (the
+`ErrStaleResponse` wrapping, `TolerateNoEcho`, and the drain) and `panic_safety_test.go` (short
+response, short caller buffers for read and write, and `responseError` over short frames — all
+return errors / no-ops instead of panicking), plus `bitwrite_test.go` for `AGWriteDBBit` (exact
+36-byte telegram, no extra request after the write, clear path, bit range validation, PLC rejection).
 
 Simatic, Simatic S5, Simatic S7, S7-200, S7-300, S7-400, S7-1200, S7-1500 are registered Trademarks of Siemens
 

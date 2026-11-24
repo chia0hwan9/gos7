@@ -37,6 +37,10 @@ const (
 	s7CpuStatusRun     = 8
 	s7CpuStatusStop    = 4
 
+	// S7 PDU types (ROSCTR) whose header carries an error class and code
+	s7PDUTypeAck     = 0x02
+	s7PDUTypeAckData = 0x03
+
 	//size header
 	sizeHeaderRead  int = 31 // Header Size when Reading
 	sizeHeaderWrite int = 35 // Header Size when Writing
@@ -60,27 +64,7 @@ type ClientHandler interface {
 type client struct {
 	packager    Packager
 	transporter Transporter
-
-	// pduRef 请求序号：每个读/写请求自增后写进报文的 PDU reference 字段（S7 头第 11-12 字节），
-	// 应答必须回显同一个值（见 tcpPackager.Verify）。这样"上一次超时后迟到的应答"能被识别出来，
-	// 而不是被当成本次请求的应答静默解析。Snap7 客户端同样校验该字段。
-	pduRef atomic.Uint32
-}
-
-// nextPduRef 返回本次请求的 PDU reference：从 1 起自增，跳过 0（0 留给握手报文）。
-func (mb *client) nextPduRef() uint16 {
-	for {
-		if ref := uint16(mb.pduRef.Add(1)); ref != 0 {
-			return ref
-		}
-	}
-}
-
-// setPduRef 把 PDU reference 写入报文（含 TPKT+COTP 前缀，S7 头从第 7 字节开始）。
-func setPduRef(request []byte, ref uint16) {
-	if len(request) >= 13 {
-		binary.BigEndian.PutUint16(request[11:], ref)
-	}
+	pduRef      uint32 // running PDU reference, see setPDUReference
 }
 
 // NewClient creates a new s7 client with given backend handler.
@@ -270,8 +254,7 @@ func (mb *client) readArea(area int, dbNumber int, start int, amount int, wordLe
 		request.Data[29] = byte(address & 0x0FF)
 		address = address >> 8
 		request.Data[28] = byte(address & 0x0FF)
-		setPduRef(request.Data, mb.nextPduRef())
-    var response *ProtocolDataUnit
+		var response *ProtocolDataUnit
 		response, sendError := mb.send(&request)
 		err = sendError
 
@@ -282,9 +265,13 @@ func (mb *client) readArea(area int, dbNumber int, start int, amount int, wordLe
 				err = fmt.Errorf(ErrorText(errIsoInvalidDataSize)+"'%v'", size)
 			case response.Data[21] != 0xFF:
 				err = fmt.Errorf(ErrorText(CPUError(uint(response.Data[21]))))
-			case size-25 < sizeRequested:
-				// 对端截断了应答：上游在这里 response.Data[25:25+sizeRequested] 会越界 panic
-				err = fmt.Errorf("%w: got %d bytes, want %d", ErrShortReadResponse, size-25, sizeRequested)
+			case readItemSize(response.Data) != sizeRequested || size < 25+sizeRequested:
+				// 数据项声明的长度与请求不符，或报文根本没有携带这么多字节：
+				// 上游在这里 response.Data[25:25+sizeRequested] 越界（response.Data 是 2084 字节
+				// 接收缓冲的子切片，所以不 panic，而是把上一地址的数据 + 零填充交给调用方）。
+				err = fmt.Errorf("%w: %s: requested %d bytes, item holds %d bytes in a %d byte telegram",
+					ErrShortReadResponse, ErrorText(errCliInvalidDataSizeRecvd),
+					sizeRequested, readItemSize(response.Data), size)
 			case offset+sizeRequested > len(buffer):
 				// 调用方缓冲区不足：上游在这里 buffer[offset:offset+sizeRequested] 会越界 panic
 				err = fmt.Errorf("%w: have %d bytes, need %d (offset %d)",
@@ -300,6 +287,18 @@ func (mb *client) readArea(area int, dbNumber int, start int, amount int, wordLe
 		start += numElements * wordSize
 	}
 	return
+}
+
+// readItemSize returns the number of data bytes a Read Var response item
+// announces in bytes 23-24. The length field counts bits for the byte, word
+// and integer transport sizes and bytes for bit, octet string and real
+// (same convention as AGReadMulti).
+func readItemSize(response []byte) int {
+	size := int(binary.BigEndian.Uint16(response[23:]))
+	if ts := response[22]; ts != tsResOctet && ts != tsResReal && ts != tsResBit {
+		size >>= 3
+	}
+	return size
 }
 
 //writeArea write generic area into PLC with following parameters:
@@ -413,7 +412,6 @@ func (mb *client) writeArea(area int, dbnumber int, start int, amount int, wordl
 			return
 		}
 		request.Data = append(request.Data[:35], append(buffer[offset:offset+dataSize], request.Data[35:]...)...)
-		setPduRef(request.Data, mb.nextPduRef())
 		response, sendError := mb.send(&request)
 		err = sendError
 		if err == nil {
@@ -527,6 +525,7 @@ func (mb *client) Read(variable string, buffer []byte) (value interface{}, err e
 
 //send the package of a pdu request and a pdu response, check for response error and verify the package
 func (mb *client) send(request *ProtocolDataUnit) (response *ProtocolDataUnit, err error) {
+	mb.setPDUReference(request.Data)
 	dataResponse, err := mb.transporter.Send(request.Data)
 	if err != nil {
 		return
@@ -548,29 +547,41 @@ func (mb *client) send(request *ProtocolDataUnit) (response *ProtocolDataUnit, e
 	return response, err
 }
 
-//responseError get response error from pdu return S7Error with high and low byte
+// setPDUReference stamps the next PDU reference into an S7 request. The
+// telegram templates carry a fixed reference, which makes every reply look
+// like the answer to every request; with a running reference the transporter
+// and the packager can tell a late reply from the expected one.
+func (mb *client) setPDUReference(request []byte) {
+	if !isS7PDU(request) {
+		return
+	}
+	ref := uint16(atomic.AddUint32(&mb.pduRef, 1))
+	binary.BigEndian.PutUint16(request[s7PDURefOffset:], ref)
+}
+
+// responseError returns the error class and code from the header of an Ack or
+// Ack_Data reply as an S7Error, or nil when the reply reports no error. Only
+// these two PDU types carry the error fields, at bytes 17-18 after the TPKT
+// and COTP headers.
+//
+// 上游原先按应答第 1 字节（TPKT reserved，恒为 0）分支、并在第 10-11 字节取错误码，
+// 所以永远不返回错误；空 case 也不会 fallthrough。这里同时保留"报文过短不越界"的保证：
+// 长度不足 isoHSize+12 时无从取错误信息，返回 nil。
 func responseError(response *ProtocolDataUnit) error {
-	s7Error := &S7Error{}
-	// 上游只检查了 len>0 就按 Data[1] 去取 Data[2..3] / Data[10..11]：短报文会越界 panic。
-	// 这里要求至少 12 字节（S7 应答头长度），否则没有可提取的错误信息。
-	if response == nil || len(response.Data) < 12 {
+	if response == nil {
 		return nil
 	}
-	switch int(response.Data[1]) {
-		case 1:
-		case 7:
-			s7Error.High = response.Data[2]
-			s7Error.Low = response.Data[3]
-			break
-		case 2:
-		case 3:
-			s7Error.High = response.Data[10]
-			s7Error.Low = response.Data[11]
-			break
-		default:
-			return nil
+	data := response.Data
+	if len(data) < isoHSize+12 || data[isoHSize] != s7ProtocolID {
+		return nil
 	}
-	return s7Error
+	switch data[isoHSize+1] {
+	case s7PDUTypeAck, s7PDUTypeAckData:
+		if class, code := data[17], data[18]; class != 0 || code != 0 {
+			return &S7Error{High: class, Low: code}
+		}
+	}
+	return nil
 }
 
 //dataSize to number of byte accordingly

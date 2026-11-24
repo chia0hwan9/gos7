@@ -31,39 +31,24 @@ const (
 	connectionTypePG    = 1 // Connect to the PLC as a PG
 	connectionTypeOP    = 2 // Connect to the PLC as an OP
 	connectionTypeBasic = 3 // Basic connection
+	// S7 PDU header behind TPKT and COTP
+	s7ProtocolID   = 0x32 // First byte of every S7 PDU
+	s7PDURefOffset = 11   // PDU reference, 2 bytes big endian, echoed by the PLC
 )
 
 // TCPClientHandler implements Packager and Transporter interface.
 type TCPClientHandler struct {
 	tcpPackager
 	tcpTransporter
-
-	// noEchoWarned 只记一次"该设备不回显 PDU reference"，避免每条报文刷日志
-	noEchoWarned atomic.Bool
 }
 
-// Verify 校验应答确实属于本次请求（判定见 classifyPduRef）：
-//   - 回显本次 reference → 放行；
-//   - 回显最近某次请求的 reference → 上一次超时后迟到的应答被读走了 → ErrStaleResponse，
-//     调用方应丢弃连接重连（否则会静默解析出上一次请求的数据）；
-//   - 其它（0 / 恒定值 / 设备自己的计数）→ 该设备不回显，放行并只警告一次。
+// Verify 复核 tcpPackager.Verify，唯一区别是 TolerateNoEcho 生效时不再校验回显
+// （否则这类设备在 Send 里已被放行、却会在这里再被判死）。逻辑本身只有一份。
 func (h *TCPClientHandler) Verify(request []byte, response []byte) error {
-	switch classifyPduRef(request, response) {
-	case refStale:
-		got := binary.BigEndian.Uint16(response[11:])
-		want := binary.BigEndian.Uint16(request[11:])
-		return fmt.Errorf("%w: got 0x%04X, want 0x%04X", ErrStaleResponse, got, want)
-	case refTooShort:
-		return fmt.Errorf("%w: short telegram (request %d bytes, response %d bytes)",
-			ErrStaleResponse, len(request), len(response))
-	case refNoEcho:
-		if h.noEchoWarned.CompareAndSwap(false, true) && h.Logger != nil {
-			h.Logger.Printf("s7: 该 PLC/网关未回显 PDU reference（应答 0x%04X / 请求 0x%04X），"+
-				"已关闭回显校验；残留应答仍由 Send 失败后的清理兜底",
-				binary.BigEndian.Uint16(response[11:]), binary.BigEndian.Uint16(request[11:]))
-		}
+	if h.TolerateNoEcho {
+		return nil
 	}
-	return nil
+	return h.tcpPackager.Verify(request, response)
 }
 
 // NewTCPClientHandler allocates a new TCPClientHandler.
@@ -102,11 +87,9 @@ func TCPClientWithConnectType(address string, rack int, slot int, connectType in
 	return NewClient(handler)
 }
 
-// tcpPackager implements Packager interface.
-type tcpPackager struct {
-	//reserve for future use, this package should be pass into trans ID, pack ID
-	//or somethingelse to verify the request and response
-}
+// tcpPackager implements Packager interface. Its Verify matches the response
+// to the request by the S7 PDU reference.
+type tcpPackager struct{}
 
 // tcpTransporter implements Transporter interface.
 type tcpTransporter struct {
@@ -137,6 +120,15 @@ type tcpTransporter struct {
 	// needsDrain 上一次收发没有干净收尾（超时/IO 错误）后置位：下一次收发前先丢弃 socket 里
 	// 已经到达的残留字节（PLC 迟到的应答），避免它被当成本次请求的应答读走。
 	needsDrain bool
+
+	// TolerateNoEcho 允许设备不回显 PDU reference（S7 规范要求回显，Snap7 客户端也不校验）。
+	// 默认 false = 严格：reference 不符的应答视为"上一次请求的迟到应答"，丢弃后继续等
+	// （能在连接落后一个应答时自行重新对齐）。置 true 则接受任何应答并只警告一次，
+	// 用于确实不回显该字段的 PLC/网关——否则这类设备每次收发都会等到超时。
+	TolerateNoEcho bool
+
+	// noEchoWarned TolerateNoEcho 生效时只记一次日志，避免每条报文刷屏。
+	noEchoWarned atomic.Bool
 }
 
 func (mb *tcpTransporter) setConnectionParameters(address string, localTSAP uint16, remoteTSAP uint16) {
@@ -189,9 +181,39 @@ func (mb *tcpTransporter) Send(request []byte) (response []byte, err error) {
 	if _, err = mb.conn.Write(request); err != nil {
 		return
 	}
-	done := false
 	data := make([]byte, tcpMaxLength)
-	length := 0
+	for {
+		var length int
+		if length, err = mb.receive(data); err != nil {
+			return nil, err
+		}
+		response = data[0:length]
+		mb.logf("s7: received % x\n", response)
+		// A reply carrying another PDU reference answers an earlier request,
+		// typically one that timed out. Taking it for the answer to this
+		// request would hand the caller foreign data, so drop it and keep
+		// waiting for the matching reply until the deadline expires.
+		if !pduReferenceMismatch(request, response) {
+			return response, nil
+		}
+		if mb.TolerateNoEcho {
+			// 该设备不回显 PDU reference：接受应答，只警告一次（旧行为）。
+			// 代价是失去"迟到应答"的识别能力，残留字节只由 needsDrain 兜底。
+			if mb.noEchoWarned.CompareAndSwap(false, true) {
+				mb.logf("s7: 该 PLC/网关未回显 PDU reference（请求 0x%04x，应答 0x%04x），"+
+					"已关闭回显校验；残留应答仅由收发失败后的清理兜底",
+					pduReference(request), pduReference(response))
+			}
+			return response, nil
+		}
+		mb.logf("s7: discarding reply with PDU reference 0x%04x, request has 0x%04x", pduReference(response), pduReference(request))
+	}
+}
+
+// receive reads one ISO-on-TCP telegram (TPKT, COTP and S7 payload) into data
+// and returns its length. Telegrams consisting of a bare COTP header are skipped.
+func (mb *tcpTransporter) receive(data []byte) (length int, err error) {
+	done := false
 	for !done && err == nil {
 		// Get TPKT (4 bytes)
 		if _, err = io.ReadFull(mb.conn, data[:4]); err != nil {
@@ -220,11 +242,6 @@ func (mb *tcpTransporter) Send(request []byte) (response []byte, err error) {
 	mb.LastPDUType = data[5] // Stores PDU Type, we need it
 	// Receives the S7 Payload
 	_, err = io.ReadFull(mb.conn, data[7:length])
-	if err != nil {
-		return
-	}
-	response = data[0:length]
-	mb.logf("s7: received % x\n", response)
 	return
 }
 
@@ -400,55 +417,36 @@ func (mb *tcpTransporter) closeIdle() {
 	}
 }
 
-// refVerdict 应答 PDU reference 的判定结果。
-type refVerdict int
-
-const (
-	refOK      refVerdict = iota // 回显本次请求的 reference（正常）
-	refStale                     // 是"最近某次请求"的 reference：迟到的应答被读走了
-	refNoEcho                    // 既不是本次、也不是最近的：该设备不回显 reference
-	refTooShort                  // 报文太短，连 reference 字段都没有
-)
-
-// staleWindow 往回看多少次请求：本连接器的 reference 由 client.nextPduRef 自增，
-// 因此"上 k 次请求的 reference"就等于 want-k，无需额外状态。
-const staleWindow = 2
-
-// classifyPduRef 判定应答的 PDU reference（S7 头第 11-12 字节，含 TPKT+COTP 前缀）。
-//
-// 参考实现（libnodave 的设备侧模拟器 ibhsim5.c）会把请求的 reference 原样写回应答
-// （PDUref = 请求 header[4..5] → 应答 header[4..5]），即"回显"是应答方的正常行为。
-// 但并非所有实现都依赖它（Snap7 只给每个请求自增、并不校验回显），所以这里按
-// 三态处理：回显本次 = 正常；回显最近的某次 = 残留应答（要拦）；其它 = 设备不回显（不拦，
-// 由调用方记一条日志），否则这类设备会永远连不上。
-func classifyPduRef(request []byte, response []byte) refVerdict {
-	if len(request) < 13 || len(response) < 13 {
-		return refTooShort
-	}
-	want := binary.BigEndian.Uint16(request[11:])
-	got := binary.BigEndian.Uint16(response[11:])
-	if got == want {
-		return refOK
-	}
-	// 自增序列（跳过 0）里往回数：want-1、want-2…
-	for k := uint16(1); k <= staleWindow; k++ {
-		if got == prevRef(want, k) {
-			return refStale
-		}
-	}
-	return refNoEcho
+// isS7PDU reports whether the telegram carries an S7 PDU behind TPKT and COTP.
+// COTP connection requests/confirms and truncated telegrams do not.
+func isS7PDU(telegram []byte) bool {
+	return len(telegram) >= s7PDURefOffset+2 && telegram[isoHSize] == s7ProtocolID
 }
 
-// prevRef 返回 reference 序列里往回数第 k 个。序列由 client.nextPduRef 自增且**跳过 0**，
-// 所以这里也要跳过 0（第一支请求的"上一次"约定为 0xFFFF，0 永远不会是真正发过的引用）。
-func prevRef(want uint16, k uint16) uint16 {
-	ref := want
-	for i := uint16(0); i < k; i++ {
-		if ref <= 1 {
-			ref = 0xFFFF
-			continue
-		}
-		ref--
+// pduReference returns the PDU reference of a telegram for which isS7PDU holds.
+func pduReference(telegram []byte) uint16 {
+	return binary.BigEndian.Uint16(telegram[s7PDURefOffset:])
+}
+
+// pduReferenceMismatch reports whether response is an S7 PDU that does not
+// echo the PDU reference of the S7 request, i.e. it answers another request.
+func pduReferenceMismatch(request, response []byte) bool {
+	return isS7PDU(request) && isS7PDU(response) && pduReference(request) != pduReference(response)
+}
+
+// Verify checks that the response answers the request: the PDU reference the
+// client stamped into the request header must come back in the response.
+// A response with another reference belongs to an earlier request, for
+// example a late answer after a timeout, and must not be interpreted as the
+// answer to this one.
+//
+// 错误同时携带两套语义：上游的 errCliPDUReferenceMismatch 文案（`CLI : PDU
+// reference mismatch…`）供既有调用方识别，以及 fork 的 ErrStaleResponse 哨兵
+// （errors.Is 可判）——iidc 的连接器按它判定"读到残留应答 → 丢弃连接重连"。
+func (mb *tcpPackager) Verify(request []byte, response []byte) (err error) {
+	if pduReferenceMismatch(request, response) {
+		err = fmt.Errorf("%w: %s: request 0x%04x, response 0x%04x", ErrStaleResponse,
+			ErrorText(errCliPDUReferenceMismatch), pduReference(request), pduReference(response))
 	}
-	return ref
+	return
 }
