@@ -215,14 +215,21 @@ func (mb *client) readArea(area int, dbNumber int, start int, amount int, wordLe
 		}
 	}
 
-	tt, _ := interface{}(mb.transporter).(*TCPClientHandler)
-
-	maxElements = (tt.PDULength - 18) / wordSize // 18 = Reply telegram header //lth note here
+	// PDULength 来自 Setup Communication 协商；没连上/协商失败时是 0。用它算分片上限会得到
+	// 非正数，读路径会 numElements<=0 而不消耗 totElements（死循环），写路径会负长度切片 panic。
+	maxElements = (mb.pduLength() - 18) / wordSize // 18 = Reply telegram header //lth note here
+	if maxElements < 1 {
+		return fmt.Errorf("%w (transporter %T)", ErrNoPDULength, mb.transporter)
+	}
 	totElements = amount
 	for totElements > 0 && err == nil {
 		numElements = totElements
 		if numElements > maxElements {
 			numElements = maxElements
+		}
+		if numElements < 1 {
+			// 兜底：任何情况下都不允许"一次请求 0/负个元素"（否则 totElements 不减，死循环）。
+			return fmt.Errorf("%w: %d elements per request", ErrNoPDULength, numElements)
 		}
 
 		sizeRequested = numElements * wordSize
@@ -336,13 +343,19 @@ func (mb *client) writeArea(area int, dbnumber int, start int, amount int, wordl
 			wordlen = s7wlbyte
 		}
 	}
-	tt, _ := interface{}(mb.transporter).(*TCPClientHandler)
-	maxElements = (tt.PDULength - 35) / wordSize // 35 = Reply telegram header
+	maxElements = (mb.pduLength() - 35) / wordSize // 35 = Reply telegram header
+	if maxElements < 1 {
+		// 未协商/协商失败：负数会让 dataSize 为负，随后 buffer[offset:offset+dataSize] 直接 panic。
+		return fmt.Errorf("%w (transporter %T)", ErrNoPDULength, mb.transporter)
+	}
 	totElements = amount
 	for totElements > 0 && err == nil {
 		numElements = totElements
 		if numElements > maxElements {
 			numElements = maxElements
+		}
+		if numElements < 1 {
+			return fmt.Errorf("%w: %d elements per request", ErrNoPDULength, numElements)
 		}
 		dataSize = numElements * wordSize
 		isoSize = sizeHeaderWrite + dataSize
@@ -556,6 +569,19 @@ func (mb *client) setPDUReference(request []byte) {
 	}
 	ref := uint16(atomic.AddUint32(&mb.pduRef, 1))
 	binary.BigEndian.PutUint16(request[s7PDURefOffset:], ref)
+}
+
+// pduLength 返回 Setup Communication 协商出的 PDU 长度，未协商/不可用时返回 0。
+//
+// 读/写路径都用它算"单条报文最多几个元素"：没连上就调用 Read/Write（或协商失败）时
+// PDULength 是 0，直接用会算出非正的上限 —— 读路径不消耗元素（死循环），写路径负长度
+// 切片（panic）。transporter 不是 *TCPClientHandler（NewClient2 传自定义实现）时同样返回 0，
+// 而不是像原来那样对 nil 指针取字段。
+func (mb *client) pduLength() int {
+	if tt, ok := interface{}(mb.transporter).(*TCPClientHandler); ok && tt != nil {
+		return tt.PDULength
+	}
+	return 0
 }
 
 // responseError returns the error class and code from the header of an Ack or

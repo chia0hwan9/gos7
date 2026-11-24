@@ -25,6 +25,13 @@ var ErrShortReadResponse = errors.New("s7: short read response")
 // ErrBufferTooSmall 调用方给的缓冲区装不下请求/写入的数据（调用方误用；上游同样会切片越界 panic）。
 var ErrBufferTooSmall = errors.New("s7: buffer too small")
 
+// ErrNoPDULength 还没有（成功的）PDU 长度协商，读/写无法算分片上限。
+//
+// 典型来源：没 Connect 就直接 Read/Write、Connect 失败（Setup Communication 没跑或没通过）、
+// 或者用 NewClient2 传了一个不是 *TCPClientHandler 的 transporter。此时单条报文能装多少元素
+// 无从得知 —— 上游会由此得到非正上限：读路径死循环、写路径负长度切片 panic。
+var ErrNoPDULength = errors.New("s7: PDU length not negotiated")
+
 const (
 	errTCPSocketCreation    = 1
 	errTCPConnectionTimeout = 2

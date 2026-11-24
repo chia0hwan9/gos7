@@ -98,9 +98,11 @@ func (mb *client) AGWriteMulti(dataItems []S7DataItem, itemsCount int) (err erro
 		offset = offset + itemDataSize + 4
 		dataLength = dataLength + itemDataSize + 4
 	}
-	tt, _ := interface{}(mb.transporter).(*TCPClientHandler)
 	//Checks the size
-	if offset > tt.PDULength {
+	if pdu := mb.pduLength(); pdu < 1 {
+		err = fmt.Errorf("%w (transporter %T)", ErrNoPDULength, mb.transporter)
+		return
+	} else if offset > pdu {
 		err = fmt.Errorf(ErrorText(errCliSizeOverPDU))
 		return
 	}
@@ -177,8 +179,10 @@ func (mb *client) AGReadMulti(dataItems []S7DataItem, itemsCount int) (err error
 		s7Multi = append(s7Multi, s7Item...)
 		offset += len(s7Item)
 	}
-	tt, _ := interface{}(mb.transporter).(*TCPClientHandler)
-	if offset > tt.PDULength {
+	if pdu := mb.pduLength(); pdu < 1 {
+		err = fmt.Errorf("%w (transporter %T)", ErrNoPDULength, mb.transporter)
+		return
+	} else if offset > pdu {
 		err = fmt.Errorf(ErrorText(errCliSizeOverPDU))
 		return
 	}
