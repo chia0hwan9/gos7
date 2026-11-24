@@ -72,23 +72,20 @@ func (mb *client) AGWriteMulti(dataItems []S7DataItem, itemsCount int) (err erro
 			s7ItemWrite[1] = tsResBit
 			itemDataSize = dataItems[i].Amount
 			binary.BigEndian.PutUint16(s7ItemWrite[2:], uint16(itemDataSize))
-			break
-		case s7wlcounter:
-		case s7wltimer:
+		case s7wlcounter, s7wltimer:
+			// 空 case 在 Go 里不 fallthrough：上游的 "case counter: case timer:" 移植过来后
+			// 计数器的 transport size 会留成 0（非法），这里合并成一个 case。
 			s7ItemWrite[1] = tsResOctet
 			itemDataSize = dataItems[i].Amount * 2
 			binary.BigEndian.PutUint16(s7ItemWrite[2:], uint16(itemDataSize))
-			break
 		case s7wlreal:
 			s7ItemWrite[1] = tsResReal // real
 			itemDataSize = dataItems[i].Amount * dataSizeByte(dataItems[i].WordLen)
 			binary.BigEndian.PutUint16(s7ItemWrite[2:], uint16(itemDataSize))
-			break
 		default:
 			s7ItemWrite[1] = tsResByte // byte/word/dword etc.
 			itemDataSize = dataItems[i].Amount * dataSizeByte(dataItems[i].WordLen)
 			binary.BigEndian.PutUint16(s7ItemWrite[2:], uint16(itemDataSize*8))
-			break
 
 		}
 		copy(s7ItemWrite[4:4+itemDataSize], dataItems[i].Data)

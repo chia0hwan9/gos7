@@ -232,5 +232,4 @@ func CPUError(err uint) int {
 	default:
 		return errCliFunctionRefused
 	}
-	return 0
 }

@@ -391,14 +391,13 @@ func (mb *client) writeArea(area int, dbnumber int, start int, amount int, wordl
 		switch wordlen {
 		case s7wlbit:
 			request.Data[32] = tsResBit
-			break
-		case s7wlcounter:
-		case s7wltimer:
+		case s7wlcounter, s7wltimer:
+			// 计数器/定时器按 octet string 传（长度按字节计）；上游把这个移植成了
+			// "case counter: 空 case + case timer:"，而 Go 的空 case 不会 fallthrough，
+			// 于是计数器写发出的 transport size 是 0（非法）。
 			request.Data[32] = tsResOctet
-			break
 		default:
 			request.Data[32] = tsResByte // byte/word/dword etc.
-			break
 		}
 		// length
 		// SetWordAt(request.Data, 33, uint16(length))
